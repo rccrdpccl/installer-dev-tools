@@ -131,7 +131,8 @@ def installAddonForAllClusters(yamlContent):
 
 
 def updateServiceAccount(yamlContent):
-    yamlContent['metadata'].pop('namespace')
+    logging.info("Updating ServiceAccount in %s", yamlContent)
+    yamlContent['metadata'].pop('namespace', None)
 
 def updateClusterRoleBinding(yamlContent):
     subjectsList = yamlContent['subjects']
@@ -289,12 +290,12 @@ def updateValues(overwrite, original):
 
 
 # Copy chart-templates to a new helmchart directory
-def copyHelmChart(destinationChartPath, repo, chart, chartVersion, branch):
+def copyHelmChart(destinationChartPath, repo, chart, chartVersion, branch, chartPath):
     chartName = chart.get('name', '')
     logging.info(f"Starting to process chart '{chartName}' chart directory")
 
     # Create main folder
-    chartPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tmp", repo, chart["chart-path"])
+    chartPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tmp", repo, chartPath)
     logging.debug(f"Chart path resolved to: '{chartPath}'")
     logging.debug(f"Destination chart path: '{destinationChartPath}'")
 
@@ -335,11 +336,12 @@ def copyHelmChart(destinationChartPath, repo, chart, chartVersion, branch):
 
     logging.info(f"Running 'helm template' for chart: '{chartName}'")
     helmTemplateOutput = subprocess.getoutput(['helm template '+ chartPath + ' --namespace=PLACEHOLDER_NAMESPACE'])
-
+    logging.info(f"Helm template output: {helmTemplateOutput}")
     yamlList = helmTemplateOutput.split('---')
     for outputContent in yamlList:
         yamlContent = yaml.safe_load(outputContent)
         if yamlContent is None:
+            logging.info(f"outputContent: {outputContent}")
             logging.warning("Skipped empty or invalid YAML content during template processing")
             continue
 
@@ -1254,12 +1256,12 @@ def split_at(the_str, the_delim, favor_right=True):
 
    return (left_part, right_part)
 
-def addCRDs(repo, chart, outputDir):
-    if not 'chart-path' in chart:
-        logging.critical(f"Chart path missing in the provided chart configuration: {chart}")
-        exit(1) 
+def addCRDs(repo, chart, outputDir, chartPathKey):
 
-    chartPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tmp", repo, chart["chart-path"])
+    destinationSuffix = ""
+    if chartPathKey == "k8s-chart-path":
+        destinationSuffix = "-k8s"
+    chartPath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tmp", repo, chart[chartPathKey])
     logging.debug(f"Chart path resolved to: '{chartPath}'")
 
     if not os.path.exists(chartPath):
@@ -1271,7 +1273,7 @@ def addCRDs(repo, chart, outputDir):
         logging.info(f"No CRDs for repo: {repo}")
         return
     
-    destinationCRDPath = os.path.join(outputDir, "crds", chart['name'])
+    destinationCRDPath = os.path.join(outputDir, "crds", f"{chart['name']}{destinationSuffix}")
     logging.debug(f"Destination chart path: '{destinationCRDPath}'")
 
     if os.path.exists(destinationCRDPath): # If path exists, remove and re-clone
@@ -1300,6 +1302,9 @@ def addCRDs(repo, chart, outputDir):
     logging.info(f"Finished processing CRDs for chart '{chart['name']}'\n")
 
 def chartConfigAcceptable(chart):
+    if not 'chart-path' in chart:
+        logging.critical(f"Chart path missing in the provided chart configuration: {chart}")
+        return False
     helmChart = chart["name"]
     if helmChart == "":
         logging.critical("Unable to generate helm chart without a name.")
@@ -1357,6 +1362,45 @@ def renderChart(chart_path):
     except subprocess.CalledProcessError as e:
         logging.error("Error rendering chart: %s", e.stderr.decode())
         return False
+
+def chartify(chart, repo, repo_name, destination, branch, skipOverrides, chartPathKey):
+    if not chartConfigAcceptable(chart):
+        logging.critical("Unable to generate helm chart without configuration requirements.")
+        exit(1)
+
+    destinationSuffix = ""
+    if chartPathKey == "k8s-chart-path":
+        destinationSuffix = "-k8s"
+    chart_name = chart.get("name", "")
+    logging.info(f"Helm Chartifying: '{chart_name}'")
+
+    # Copy over all CRDs to the destination directory
+    logging.info(f"Adding CRDs for chart: '{chart_name}'")
+    addCRDs(repo_name, chart, destination, chartPathKey)
+
+    logging.info(f"Creating helm chart: '{chart_name}'")
+    always_or_toggle = chart['always-or-toggle']
+    destinationChartPath = os.path.join(destination, "charts", always_or_toggle, f"{chart['name']}{destinationSuffix}")
+
+    # Extract the chart version from the charts configuration,
+    # ensuring the version is derived from the repository branch when applicable.
+    chartVersion = getChartVersion(chart['updateChartVersion'], repo)
+
+    # Template Helm Chart Directory from 'chart-templates'
+    logging.info(f"Templating helm chart '{chart_name}'")
+    copyHelmChart(destinationChartPath, repo_name, chart, chartVersion, branch, chart[chartPathKey])
+
+    # Render the helm chart before updating the chart resources.
+    if not renderChart(destinationChartPath):
+        logging.error(f"Failed to render chart {destinationChartPath}")
+
+    # Update the helm chart resources with additional overrides
+    updateResources(destination, repo_name, chart)
+
+    if not skipOverrides:
+        logging.info("Adding Overrides (set --skipOverrides=true to skip) ...")
+        injectRequirements(destinationChartPath, chart, branch)
+        logging.info("Overrides added.\n")
 
 def main():
     ## Initialize ArgParser
@@ -1432,44 +1476,11 @@ def main():
             repository.git.checkout(branch) # If a branch is specified, checkout that branch
         else:
             branch = ""
-        
         # Loop through each operator in the repo identified by the config
         for chart in repo["charts"]:
-            if not chartConfigAcceptable(chart):
-                logging.critical("Unable to generate helm chart without configuration requirements.")
-                exit(1)
-
-            chart_name = chart.get("name", "")
-            logging.info(f"Helm Chartifying: '{chart_name}'")
-
-            # Copy over all CRDs to the destination directory
-            logging.info(f"Adding CRDs for chart: '{chart_name}'")
-            addCRDs(repo_name, chart, destination)
-
-            logging.info(f"Creating helm chart: '{chart_name}'")
-            always_or_toggle = chart['always-or-toggle']
-            destinationChartPath = os.path.join(destination, "charts", always_or_toggle, chart['name'])
-
-            # Extract the chart version from the charts configuration, 
-            # ensuring the version is derived from the repository branch when applicable.
-            chartVersion = getChartVersion(chart['updateChartVersion'], repo)
-
-            # Template Helm Chart Directory from 'chart-templates'
-            logging.info(f"Templating helm chart '{chart_name}'")
-            copyHelmChart(destinationChartPath, repo_name, chart, chartVersion, branch)
-
-            # Render the helm chart before updating the chart resources.
-            if not renderChart(destinationChartPath):
-                logging.error(f"Failed to render chart {destinationChartPath}")
-            
-            # Update the helm chart resources with additional overrides
-            updateResources(destination, repo_name, chart)
-
-            if not skipOverrides:
-                logging.info("Adding Overrides (set --skipOverrides=true to skip) ...")
-
-                injectRequirements(destinationChartPath, chart, branch)
-                logging.info("Overrides added.\n")
+            chartify(chart, repo, repo_name, destination, branch, skipOverrides, "chart-path")
+            if 'k8s-chart-path' in chart:
+                chartify(chart, repo, repo_name, destination, branch, skipOverrides, "k8s-chart-path")
 
     logging.info("All repositories and operators processed successfully.")
     logging.info("Performing cleanup...")
