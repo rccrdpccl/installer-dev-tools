@@ -130,6 +130,9 @@ def installAddonForAllClusters(yamlContent):
     yamlContent['spec']['installStrategy'] = install_strategy
 
 
+def updateCertificate(yamlContent):
+    yamlContent['metadata']['namespace'] = '{{ .Values.global.namespace }}'
+
 def updateServiceAccount(yamlContent):
     yamlContent['metadata'].pop('namespace', None)
 
@@ -236,7 +239,9 @@ def updateResources(outputDir, repo, chart):
                 updateClusterRoleBinding(yamlContent)
             else:
                 logging.warning(f"Skipping ClusterRoleBinding update (RBAC override is disabled) in {filePath}")
-
+        elif kind == "Certificate":
+            logging.info(f"Updating Certificate in {filePath}")
+            updateCertificate(yamlContent)
         else:
             continue
 
@@ -864,6 +869,22 @@ def replace_default(data, old, new):
         return data.replace(old, new)
     return data
 
+def update_certmanager_annotations(resource):
+    if 'metadata' not in resource:
+        logging.info(f"[certmanager] METADATA NOT IN RESOURCE {resource}")
+        return
+    certmanager_annotations = resource['metadata'].get('annotations', {})
+    if 'cert-manager.io/inject-ca-from' not in certmanager_annotations:
+        logging.warning("[certmanager] annotation cert-manager.io/inject-ca-from not found")
+        return
+    annotation_value_name = certmanager_annotations['cert-manager.io/inject-ca-from'].split('/')[-1]
+    logging.info(f"[certmanager] annotation cert-manager.io/inject-ca-from value of {annotation_value_name}")
+
+    annotation_updated_value = '{{ .Values.global.namespace  }}' + '/' + annotation_value_name
+    logging.info(f"annotation cert-manager.io/inject-ca-from update value of {annotation_updated_value}")
+    certmanager_annotations['cert-manager.io/inject-ca-from'] = annotation_updated_value
+    resource['metadata']['annotations'] = certmanager_annotations
+
 # updateHelmResources adds standard configuration to the generic kubernetes resources
 def update_helm_resources(chartName, helmChart, skip_rbac_overrides, exclusions, inclusions, branch):
     logging.info(f"Updating resources chart: {chartName}")
@@ -893,6 +914,7 @@ def update_helm_resources(chartName, helmChart, skip_rbac_overrides, exclusions,
         # Set the default namespace for the chart.
         default_namespace = """{{ .Values.global.namespace }}"""
 
+        logging.info("FINDME: UPDATING ANNOTATIONS")
         for template_path in resource_templates:
             try:
                 with open(template_path, 'r') as f:
@@ -1006,6 +1028,7 @@ def update_helm_resources(chartName, helmChart, skip_rbac_overrides, exclusions,
                                     target_namespace = f"{{{{ default \"{subject_namespace}\" .Values.global.namespace }}}}"
                                     subject['namespace'] = target_namespace
                             logging.info(f"Subject namespace for {resource_name} set to: {target_namespace} (Helm default used).\n")
+                update_certmanager_annotations(resource_data)
 
                 with open(template_path, 'w') as f:
                     yaml.dump(resource_data, f, width=float("inf"), default_flow_style=False, allow_unicode=True)
